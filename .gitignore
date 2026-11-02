@@ -1,0 +1,5 @@
+__pycache__/
+files_exploits.csv
+exploit_index.json
+breach_cache.json
+.DS_Store
