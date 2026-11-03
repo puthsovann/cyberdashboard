@@ -56,12 +56,12 @@ DATA = {
 DATA_LOCK = threading.Lock()
 
 EDB = {"building": False, "ready": False, "size": None,
-       "map": {}, "recs": {}, "latest": []}
+       "map": {}, "recs": {}, "latest": [], "error": None}
 EDB_LOCK = threading.Lock()
 
 
-def fetch_url(url, timeout=FETCH_TIMEOUT):
-    req = urllib.request.Request(url, headers=UA)
+def fetch_url(url, timeout=FETCH_TIMEOUT, headers=None):
+    req = urllib.request.Request(url, headers={**UA, **(headers or {})})
     with urllib.request.urlopen(req, timeout=timeout, context=SSL_CTX) as r:
         return r.read()
 
@@ -189,10 +189,14 @@ def _edb_build_thread():
             open(EDB_CSV, encoding="utf-8", errors="replace").read())
         save_edb_index(mapping, recs, latest, size or os.path.getsize(EDB_CSV))
         _edb_apply(mapping, recs, latest, size or 0)
+        with EDB_LOCK:
+            EDB["error"] = None
         print(f"  [+] EDB index: {len(mapping)} CVEs mapped, "
               f"{len(latest)} exploits, {time.time() - t0:.0f}s",
               flush=True)
     except Exception as exc:
+        with EDB_LOCK:
+            EDB["error"] = str(exc)
         print(f"  [-] EDB build: {exc}", flush=True)
     finally:
         with EDB_LOCK:
@@ -230,6 +234,8 @@ def edb_tick():
                 return  # already built, size change checked next sweep
         threading.Thread(target=_edb_build_thread, daemon=True).start()
     except Exception as exc:
+        with EDB_LOCK:
+            EDB["error"] = str(exc)
         print(f"  [-] EDB index: {exc}", flush=True)
 
 
@@ -246,7 +252,11 @@ def nvd_recent_cves(days=7):
         url = ("https://services.nvd.nist.gov/rest/json/cves/2.0"
                f"?pubStartDate={first}&pubEndDate={end}"
                f"&resultsPerPage=600&startIndex={start}")
-        return json.loads(fetch_url(url).decode("utf-8", "replace"))
+        hdr = {}
+        key = os.environ.get("NVD_API_KEY")
+        if key:
+            hdr["apiKey"] = key
+        return json.loads(fetch_url(url, headers=hdr).decode("utf-8", "replace"))
 
     raw, total, span = None, 0, days
     for span in (days, 3, 2, 1):
@@ -634,11 +644,53 @@ def breach_feed():
 
 # ------------------------------------------------------------------ engine
 
+SWEEP = {"running": False, "last": 0.0}
+SWEEP_LOCK = threading.Lock()
+
+
+def _sweep_guard():
+    with SWEEP_LOCK:
+        if SWEEP["running"]:
+            return False
+        SWEEP["running"] = True
+        return True
+
+
+def _sweep_release():
+    with SWEEP_LOCK:
+        SWEEP["running"] = False
+        SWEEP["last"] = time.time()
+
+
+def trigger_refresh():
+    """Kick one sweep in the background. False if one is already running."""
+    if not _sweep_guard():
+        return False
+
+    def _run():
+        try:
+            refresh_once()
+        except Exception as exc:
+            print(f"[-] sweep crash: {exc}", flush=True)
+        finally:
+            _sweep_release()
+
+    threading.Thread(target=_run, daemon=True).start()
+    return True
+
+
 def refresh_once():
     errors, cves, kev, news, attacks = [], [], [], [], []
     ai, breach = [], []
     print("[*] refresh sweep starting...", flush=True)
     breach_tick()  # load cached HIBP before the panel is built
+
+    with DATA_LOCK:  # previous good state, kept when a source fails
+        prev = {k: (list(v) if isinstance(v, list) else v)
+                for k, v in DATA.items()}
+    key_of = {"NVD CVEs": "cves", "CISA KEV": "kev",
+              "Ransomware": "attacks", "AI Wire": "ai",
+              "Data Breach": "breach"}
 
     jobs = (
         ("NVD CVEs", nvd_recent_cves), ("CISA KEV", cisa_kev),
@@ -665,8 +717,21 @@ def refresh_once():
                 news.extend(r)
             print(f"  [+] {name}: {len(r)} items", flush=True)
         except Exception as exc:
-            errors.append(f"{name}: {exc}")
-            print(f"  [-] {name}: {exc}", flush=True)
+            errors.append(f"{name}: {exc} (kept last good data)")
+            print(f"  [-] {name}: {exc} — keeping previous data", flush=True)
+            k = key_of.get(name)
+            if k == "cves" and not cves:
+                cves = prev.get("cves") or []
+            elif k == "kev" and not kev:
+                kev = prev.get("kev") or []
+            elif k == "attacks" and not attacks:
+                attacks = prev.get("attacks") or []
+            elif k == "ai" and not ai:
+                ai = prev.get("ai") or []
+            elif k == "breach" and not breach:
+                breach = prev.get("breach") or []
+            elif not news:
+                news = prev.get("news") or []
 
     with DATA_LOCK:
         DATA["cves"] = cves
@@ -694,7 +759,13 @@ def refresh_once():
 
 def refresh_loop():
     while True:
-        refresh_once()
+        if _sweep_guard():
+            try:
+                refresh_once()
+            except Exception as exc:
+                print(f"[-] sweep crash: {exc}", flush=True)
+            finally:
+                _sweep_release()
         time.sleep(REFRESH_MAX_AGE)
 
 
@@ -748,6 +819,12 @@ h1 .dot{color:var(--red)}
 .pill.live i{display:inline-block;width:7px;height:7px;border-radius:50%;
   background:var(--green);margin-right:7px;vertical-align:0;
   box-shadow:0 0 8px rgba(52,211,153,.8);animation:pulse 2s infinite}
+.refresh-btn{font-family:var(--mono);font-size:.68rem;color:var(--dim);
+  cursor:pointer;transition:color .15s,border-color .15s,box-shadow .15s}
+.refresh-btn:hover{color:var(--cyan);border-color:var(--cyan);
+  box-shadow:0 0 12px rgba(34,210,238,.15)}
+.refresh-btn.busy{opacity:.65;cursor:wait;color:var(--amber);
+  border-color:var(--amber);animation:pulse 1.4s infinite}
 .ticker{height:2px;border-radius:2px;margin-bottom:20px;
   background:linear-gradient(90deg,var(--red),var(--orange) 25%,var(--yellow)
   45%,var(--green) 62%,var(--cyan) 80%,var(--violet));opacity:.65}
@@ -1004,6 +1081,21 @@ document.querySelectorAll('.chip[data-v]').forEach(c=>{
 const search=document.getElementById('q');
 if(search){search.addEventListener('input',()=>{
   q=search.value.toLowerCase();apply();});}
+const rb=document.getElementById('refresh');
+if(rb){rb.addEventListener('click',async()=>{
+  if(rb.classList.contains('busy'))return;
+  rb.classList.add('busy');
+  try{await fetch('/refresh',{cache:'no-store'});}catch(e){}
+  const t0=Date.now();
+  const poll=async()=>{
+    try{const d=await(await fetch('/api/dashboard',{cache:'no-store'})).json();
+      if(!d.sweep_running){location.reload();return;}
+    }catch(e){}
+    if(Date.now()-t0<240000)setTimeout(poll,3000);
+    else{rb.classList.remove('busy');}
+  };
+  setTimeout(poll,3000);
+});}
 """
 
 HTML_HEAD = """<!DOCTYPE html>
@@ -1025,6 +1117,8 @@ HTML_HEAD = """<!DOCTYPE html>
   </div>
   <div class="pillrow">
     <span class="pill live"><i></i>LIVE</span>
+    <button class="pill refresh-btn" id="refresh"
+      title="force an immediate feed sweep">&#8635; refresh</button>
     <span class="pill">clock <b id="clock">&mdash;</b></span>
     <span class="pill">swept <b>__UPDATED__</b></span>
     <span class="pill"><a href="/api/dashboard">/api/dashboard</a></span>
@@ -1066,6 +1160,8 @@ def render():
         edb_recs = dict(EDB["recs"])
         edb_ready = EDB["ready"]
         edb_latest = list(EDB["latest"])
+        edb_err = EDB["error"]
+        edb_building = EDB["building"]
 
     cves, kev, attacks = d["cves"], d["kev"], d["attacks"]
     gangs, news, ai = d["gangs"], d["news"], d["ai"]
@@ -1259,8 +1355,15 @@ def render():
                      f"&#9876; EDB-{escape(r['id'])}</a></span><br>"
                      f"<span class='d'>{escape(r['d'])}</span><br>"
                      f"{etags}</li>")
-    edb_html = edb_html or ("<li class='empty'>Indexing Exploit-DB "
-                            "(first build ~10MB)... </li>")
+    edb_html = edb_html or (
+        "<li class='empty'>EDB build failed: "
+        + escape(edb_err, quote=False)
+        + "<br>fix: commit files_exploits.csv into the repo, "
+          "or retry via &#8635; refresh</li>"
+        if edb_err else
+        ("<li class='empty'>Indexing Exploit-DB… building (10MB, "
+         "one-time per deploy)</li>" if edb_building else
+         "<li class='empty'>Waiting for Exploit-DB index…</li>"))
 
     news_html = ""
     for n in news:
@@ -1368,7 +1471,20 @@ class Handler(BaseHTTPRequestHandler):
                 snap = {k: (list(v) if isinstance(v, list) else v)
                         for k, v in DATA.items()}
                 snap["edb_map_ready"] = EDB["ready"]
+                snap["sweep_running"] = SWEEP["running"]
+                snap["edb_state"] = {"building": EDB["building"],
+                                     "ready": EDB["ready"],
+                                     "error": EDB["error"],
+                                     "size": EDB["size"]}
                 body = json.dumps(snap, default=str).encode()
+            ct, code = "application/json", 200
+        elif self.path == "/refresh":
+            ok = trigger_refresh()
+            body = json.dumps({
+                "status": "started" if ok else "busy",
+                "running": SWEEP["running"],
+                "updated": DATA["updated"],
+            }).encode()
             ct, code = "application/json", 200
         elif self.path in ("/", "/index.html"):
             body = render().encode()
