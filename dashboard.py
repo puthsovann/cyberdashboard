@@ -409,6 +409,115 @@ def _norm_date(raw):
         return raw[:16]
 
 
+def _plain(text, n=500):
+    """Tags and entities out, whitespace collapsed."""
+    t = re.sub(r"<[^>]+>", " ", text or "")
+    return re.sub(r"\s+", " ", unescape(t)).strip()[:n]
+
+
+SUM_CACHE = {}
+SUM_LOCK = threading.Lock()
+
+
+def _sum_ok(url):
+    """http(s) only, no localhost or RFC1918 targets."""
+    try:
+        p = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    if p.scheme not in ("http", "https") or not p.hostname:
+        return False
+    h = p.hostname.lower()
+    if h in ("localhost", "localhost.localdomain", "::1"):
+        return False
+    return not re.match(
+        r"^(127\.|10\.|192\.168\.|169\.254\.|0\.|"
+        r"172\.(?:1[6-9]|2\d|3[01])\.)", h)
+
+
+GN_CACHE = {}
+
+
+def _gn_resolve(url):
+    """Google News RSS link -> publisher URL, via the splash endpoint."""
+    if "news.google.com/rss/articles/" not in url:
+        return url
+    if url in GN_CACHE:
+        return GN_CACHE[url]
+    try:
+        page = fetch_url(url, timeout=12, headers={
+            "User-Agent": DDG_UA}).decode("utf-8", "replace")
+        aid = re.search(r'data-n-a-id="([^"]+)"', page).group(1)
+        sig = re.search(r'data-n-a-sg="([^"]+)"', page).group(1)
+        ts = re.search(r'data-n-a-ts="([^"]+)"', page).group(1)
+    except Exception:
+        return url
+    inner = json.dumps(["garturlreq", [
+        ["X", "X", ["X", "X"], None, None, 1, 1, "US:en", None, 1,
+         None, None, None, None, None, 0, 1], "X", "X", 1, [1, 1, 1],
+        1, 1, None, 0, 0, None, 0], aid, int(ts), sig])
+    data = urllib.parse.urlencode({
+        "f.req": json.dumps([[["Fbv4je", inner]]])}).encode()
+    req = urllib.request.Request(
+        "https://news.google.com/_/DotsSplashUi/data/batchexecute",
+        data=data, headers={
+            "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8",
+            "User-Agent": DDG_UA})
+    try:
+        raw = urllib.request.urlopen(req, timeout=15).read().decode(
+            "utf-8", "replace")
+        m = re.search(r'garturlres.{0,8}?(https?://[^"\\]+)', raw)
+        if not m:
+            return url
+        out = m.group(1).replace("\\/", "/")
+        if len(GN_CACHE) > 400:
+            GN_CACHE.clear()
+        GN_CACHE[url] = out
+        return out
+    except Exception:
+        return url
+
+
+def page_summary(url, limit=700):
+    """On-demand summary for a row that shipped without a description."""
+    url = (url or "").strip()
+    if not url or not _sum_ok(url):
+        return ""
+    with SUM_LOCK:
+        if url in SUM_CACHE:
+            return SUM_CACHE[url]
+    target = _gn_resolve(url)
+    if not _sum_ok(target):
+        target = url
+    try:
+        html = fetch_url(target, timeout=12, headers={
+            "User-Agent": DDG_UA}).decode("utf-8", "replace")
+    except Exception:
+        return ""
+    s = ""
+    for pat in (
+        r"<meta[^>]+(?:property|name)=['\"](?:og:description|"
+        r"twitter:description|description)['\"][^>]*content=['\"]([^'\"]+)",
+        r"<meta[^>]+content=['\"]([^'\"]+)['\"][^>]*(?:property|name)=['\"]"
+        r"(?:og:description|twitter:description|description)['\"]",
+    ):
+        m = re.search(pat, html, re.I)
+        if m:
+            s = _plain(m.group(1), limit)
+            break
+    if not s:
+        for para in re.findall(r"<p[^>]*>(.*?)</p>", html, re.S | re.I)[:12]:
+            t = _plain(para, limit)
+            if len(t) >= 80:
+                s = t
+                break
+    with SUM_LOCK:
+        if len(SUM_CACHE) > 400:
+            SUM_CACHE.clear()
+        SUM_CACHE[url] = s
+    return s
+
+
 def parse_feed(xml_bytes):
     try:
         root = ET.fromstring(xml_bytes)
@@ -428,14 +537,17 @@ def parse_feed(xml_bytes):
                 link = le.get("href", "")
             items.append({"title": gt("title"), "link": link,
                           "date": _norm_date(gt("updated")
-                                             or gt("published"))})
+                                             or gt("published")),
+                          "summary": _plain(gt("summary")
+                                            or gt("content"))})
     else:
         for it in root.iter("item"):
             def gt(tag):
                 el = it.find(tag)
                 return (el.text or "").strip() if el is not None else ""
             items.append({"title": gt("title"), "link": gt("link"),
-                          "date": _norm_date(gt("pubDate"))})
+                          "date": _norm_date(gt("pubDate")),
+                          "summary": _plain(gt("description"))})
     return items[:12]
 
 
@@ -925,7 +1037,9 @@ def _gnews(q, hl, gl, ceid):
     out = []
     for i in parse_feed(fetch_url(url, headers={"User-Agent": "Mozilla/5.0"})):
         title = re.sub(r"\s+-\s+[^-]{2,42}$", "", i["title"]).strip()
-        out.append({**i, "title": title})
+        # Google News descriptions are just the headline plus the publisher,
+        # which makes a useless summary once the headline is stripped.
+        out.append({**i, "title": title, "summary": ""})
     return out
 
 
@@ -1261,6 +1375,7 @@ def watch_post(url):
                 "source": row.get("source") or "x.com",
                 "lane": _kh_lane(title, row.get("source") or ""),
                 "term": _kh_hit(title) or "watchlist",
+                "body": (row.get("body") or "")[:700],
             })
             cur.sort(key=lambda x: x.get("date") or "", reverse=True)
             DATA["kh"] = cur[:60]
@@ -1343,7 +1458,8 @@ def kh_watch(attacks=None, breaches=None):
     attacks, breaches = attacks or [], breaches or []
     items, seen = [], set()
 
-    def add(title, link, date, source, hay="", force=False, lane=None):
+    def add(title, link, date, source, hay="", force=False, lane=None,
+            summary=""):
         title = re.sub(r"\s+", " ", (title or "")).strip()
         if not title:
             return
@@ -1357,11 +1473,20 @@ def kh_watch(attacks=None, breaches=None):
         if not key or key in seen:
             return
         seen.add(key)
+        brief = re.sub(r"\s+", " ", unescape(summary or "")).strip()
+        if not brief:
+            brief = re.sub(r"\s+", " ", (hay or "")).strip()
+        # Tweets and RSS summaries often restate the headline; drop the echo.
+        head = title.lower()[:60]
+        if head and brief.lower().startswith(head):
+            cut = len(title) if len(brief) > len(title) else len(head)
+            brief = brief[cut:].lstrip(" :-–—|").strip() or brief
         items.append({
             "title": title[:220], "link": link or "",
             "date": (date or "")[:16], "source": source or "wire",
             "lane": lane or _kh_lane(title, source),
             "term": hit or "watchlist",
+            "body": brief[:700],
         })
 
     jobs = []
@@ -1394,7 +1519,8 @@ def kh_watch(attacks=None, breaches=None):
             for r in rows:
                 add(r.get("title"), r.get("link"), r.get("date"),
                     r.get("source") or src, r.get("body") or "",
-                    r.get("force", False), r.get("lane"))
+                    r.get("force", False), r.get("lane"),
+                    summary=(r.get("summary") or r.get("body") or ""))
 
     try:
         kh_victims = _rf_country_kh()
@@ -1411,7 +1537,16 @@ def kh_watch(attacks=None, breaches=None):
                 or _kh_hit_strict(hay)):
             add(f"{a.get('gang', '?')} claims {a.get('victim', '?')}",
                 a.get("url") or "", a.get("date") or "",
-                "ransomware.live", hay=hay, force=True, lane="RANSOM")
+                "ransomware.live", hay=hay, force=True, lane="RANSOM",
+                summary=(f"{a.get('gang', '?')} listed "
+                         f"{a.get('victim', '?')}"
+                         + (f" ({a.get('activity')})" if a.get("activity")
+                            else "")
+                         + (f" on {a.get('site')}" if a.get("site") else "")
+                         + f". Country record: {a.get('country') or 'KH'}. "
+                         "Claim published on the group's leak site and "
+                         "indexed by ransomware.live; the victim has not "
+                         "confirmed it."))
 
     with B_LOCK:
         catalog = list(B.get("breaches") or [])
@@ -1422,7 +1557,8 @@ def kh_watch(attacks=None, breaches=None):
             src = ("HIBP" if b.get("source") == "HIBP"
                    or b.get("kind") == "catalog" else "DataBreaches.net")
             add(b.get("org") or b.get("title") or "", b.get("link") or "",
-                b.get("date") or "", src, hay=hay, lane="BREACH")
+                b.get("date") or "", src, hay=hay, lane="BREACH",
+                summary=(b.get("desc") or ""))
 
     order = {lane: i for i, lane in enumerate(KH_LANES)}
     items.sort(key=lambda x: (x["date"], -order.get(x["lane"], 9)),
@@ -1729,6 +1865,22 @@ h1 .dot{color:var(--red)}
   border-color:rgba(131,156,201,.35)}
 .khsub{font-size:.64rem;color:var(--dim);margin-top:3px;
   font-family:var(--mono)}
+.khmor{color:var(--rose);opacity:.75;margin-left:8px;
+  letter-spacing:.04em}
+.ulu li.khi{cursor:pointer}
+.ulu li.khi:hover .khmor{opacity:1}
+.ulu li.khi.open{background:rgba(38,58,107,.2)}
+.ulu li.khi.open .khmor{color:var(--faint)}
+.khsum{margin-top:9px;padding:10px 13px;border-left:2px solid var(--rose);
+  background:rgba(4,8,18,.55);border-radius:0 8px 8px 0;
+  font-size:.79rem;line-height:1.62;color:var(--text);cursor:text}
+.khsum p{margin:0}
+.khmeta{margin-top:8px;font-family:var(--mono);font-size:.63rem;
+  color:var(--faint);display:flex;gap:8px;flex-wrap:wrap;
+  align-items:center}
+.khopen{color:var(--cyan);text-decoration:none;
+  border-bottom:1px dotted rgba(34,210,238,.5)}
+.khopen:hover{color:var(--sky)}
 .khnote{font-size:.66rem;color:var(--faint);padding:8px 18px 2px;
   font-family:var(--mono);line-height:1.5}
 .p-gloss .ph .ic{color:var(--violet);background:rgba(167,139,250,.12)}
@@ -1933,6 +2085,45 @@ document.querySelectorAll('.chip[data-kh]').forEach(c=>{
     c.classList.add('active');khLane=c.dataset.kh;khApply();});});
 const khq=document.getElementById('khq');
 if(khq){khq.addEventListener('input',khApply);}
+document.querySelectorAll('#kh>li.khi').forEach(li=>{
+  const sum=li.querySelector('.khsum');
+  const mor=li.querySelector('.khmor');
+  const fill=async()=>{
+    if(!sum||sum.dataset.filled==='1'||sum.dataset.empty!=='1')return;
+    const link=li.querySelector('a.khopen');
+    if(!link)return;
+    sum.dataset.filled='1';
+    const p=sum.querySelector('p');
+    if(p)p.textContent='fetching summary…';
+    try{
+      const r=await fetch('/sum?u='+encodeURIComponent(link.href),
+        {cache:'no-store'});
+      const d=await r.json();
+      if(p)p.textContent=d.summary||
+        'No description published on the page — open the source.';
+      if(d.resolved&&d.resolved!==link.href){
+        link.href=d.resolved;
+        const t=li.querySelector('a[href]:not(.khopen)');
+        if(t)t.href=d.resolved;
+      }
+    }catch(e){
+      if(p)p.textContent='Could not fetch a summary — open the source.';
+    }
+  };
+  const flip=()=>{
+    if(!sum)return;
+    const open=li.classList.toggle('open');
+    sum.hidden=!open;
+    li.setAttribute('aria-expanded',open?'true':'false');
+    if(mor)mor.textContent=open?'less ↑':'summary ↓';
+    if(open)fill();
+  };
+  li.addEventListener('click',e=>{
+    if(e.target.closest('a')||e.target.closest('.khsum'))return;
+    flip();});
+  li.addEventListener('keydown',e=>{
+    if(e.key==='Enter'||e.key===' '){e.preventDefault();flip();}});
+});
 """
 
 HTML_HEAD = """<!DOCTYPE html>
@@ -2080,16 +2271,30 @@ def render():
             f"<a href='{escape(k['link'])}' target='_blank' rel='noopener'>"
             f"{escape(k['title'])}</a>" if k["link"]
             else f"<span>{escape(k['title'])}</span>")
+        body = (k.get("body") or "").strip()
+        brief = (escape(body) if body else
+                 "No summary captured for this row &mdash; open the source "
+                 "for the full report.")
+        empty = "" if body else " data-empty='1'"
+        src_link = (f"<a class='khopen' href='{escape(k['link'])}' "
+                    f"target='_blank' rel='noopener'>open source "
+                    f"&nearr;</a>" if k["link"] else "")
         kh_html += (
-            f"<li data-lane='{escape(k['lane'])}' "
-            f"data-q='{escape(q, quote=True)}'>"
+            f"<li class='khi' data-lane='{escape(k['lane'])}' "
+            f"data-q='{escape(q, quote=True)}' tabindex='0' "
+            f"role='button' aria-expanded='false'>"
             f"<span class='date'>{escape(k['date'])}</span>"
             f"<span class='khlane kh-{escape(k['lane'])}' "
             f"title='{escape(KH_TIP.get(k['lane'], ''), quote=True)}'>"
             f"{escape(k['lane'])}</span>"
             f"{title_html}"
             f"<div class='khsub'>[{escape(k['source'])}]"
-            f" &middot; match: {escape(k['term'])}</div></li>")
+            f" &middot; match: {escape(k['term'])}"
+            f"<span class='khmor'>summary &darr;</span></div>"
+            f"<div class='khsum'{empty} hidden><p>{brief}</p>"
+            f"<div class='khmeta'>{escape(k['date'])} &middot; "
+            f"{escape(k['lane'])} &middot; {escape(k['source'])} "
+            f"{src_link}</div></div></li>")
     kh_html = kh_html or (
         "<li class='empty'>No Cambodia signals yet &mdash; the first sweep "
         "builds them (Google/Bing news, Reddit, Telegram mirrors, "
@@ -2381,6 +2586,14 @@ class Handler(BaseHTTPRequestHandler):
                 "running": SWEEP["running"],
                 "updated": DATA["updated"],
             }).encode()
+            ct, code = "application/json", 200
+        elif self.path.startswith("/sum"):
+            qs = urllib.parse.parse_qs(
+                urllib.parse.urlparse(self.path).query)
+            u = (qs.get("u") or [""])[0]
+            res = {"url": u, "summary": page_summary(u),
+                   "resolved": _gn_resolve(u)}
+            body = json.dumps(res).encode()
             ct, code = "application/json", 200
         elif self.path.startswith("/watch"):
             qs = urllib.parse.parse_qs(
