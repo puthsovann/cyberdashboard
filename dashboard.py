@@ -24,15 +24,19 @@ import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
-from html import escape
+from html import escape, unescape
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 
 PORT = int(os.environ.get("PORT", 11111))  # Render injects $PORT
 REFRESH_MAX_AGE = 15 * 60
 FETCH_TIMEOUT = 25
 UA = {"User-Agent": "CyberDashboard/1.0 (threat-intel aggregator)"}
+DDG_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+          "AppleWebKit/537.36 (KHTML, like Gecko) "
+          "Chrome/124.0 Safari/537.36")
 CVE_WINDOW = "last 7 days"
 
 SSL_CTX = ssl.create_default_context()
@@ -45,13 +49,14 @@ EDB_CSV_URL = ("https://gitlab.com/exploit-database/exploitdb/-/raw/main/"
 EDB_CSV = os.path.join(HERE, "files_exploits.csv")
 EDB_INDEX = os.path.join(HERE, "exploit_index.json")
 BREACH_CACHE = os.path.join(HERE, "breach_cache.json")
+CVE_CACHE = os.path.join(HERE, "cve_cache.json")
 CVE_RE = re.compile(r"CVE-\d{4}-\d{4,7}", re.I)
 BREACH_AGE = 6 * 3600  # HIBP catalog changes slowly; refetch every 6h
 
 DATA = {
     "cves": [], "kev": [], "news": [], "attacks": [],
     "gangs": [], "updated": None, "errors": [], "ai": [], "breach": [],
-    "edb": {"ready": False, "count": 0, "latest": []},
+    "kh": [], "edb": {"ready": False, "count": 0, "latest": []},
 }
 DATA_LOCK = threading.Lock()
 
@@ -241,7 +246,25 @@ def edb_tick():
 
 # --------------------------------------------------------- other sources
 
-def nvd_recent_cves(days=7):
+def _cve_load():
+    """Last good CVE slice from disk — a cold boot is never blank."""
+    try:
+        with open(CVE_CACHE, encoding="utf-8") as f:
+            return json.load(f).get("cves") or []
+    except Exception:
+        return []
+
+
+def _cve_save(cves):
+    try:
+        with open(CVE_CACHE, "w", encoding="utf-8") as f:
+            json.dump({"saved": datetime.now(timezone.utc).isoformat(),
+                       "cves": cves[:120]}, f)
+    except Exception:
+        pass
+
+
+def nvd_recent_cves(days=2):
     """Recent published CVEs (NVD 2.0, keyless) — adaptive window."""
     global CVE_WINDOW
 
@@ -256,16 +279,27 @@ def nvd_recent_cves(days=7):
         key = os.environ.get("NVD_API_KEY")
         if key:
             hdr["apiKey"] = key
-        return json.loads(fetch_url(url, headers=hdr).decode("utf-8", "replace"))
+        return json.loads(fetch_url(url, headers=hdr, timeout=45
+                                    ).decode("utf-8", "replace"))
 
     raw, total, span = None, 0, days
-    for span in (days, 3, 2, 1):
-        raw = query(span)
+    ladder = [days] + [d for d in (3, 2, 1) if d < days]
+    for span in ladder:
+        try:
+            raw = query(span)
+        except Exception as exc:
+            print(f"  [-] NVD {span}d window: {exc}", flush=True)
+            continue
         total = raw.get("totalResults", 0)
         if total <= 600:
             break
-    else:
-        raw = query(1, start=max(total - 600, 0))
+    if raw is None:
+        raise RuntimeError("NVD unreachable at every window")
+    if total > 600:
+        try:
+            raw = query(1, start=max(total - 600, 0))
+        except Exception as exc:
+            print(f"  [-] NVD newest slice: {exc}", flush=True)
     CVE_WINDOW = ("24h (newest slice)" if total > 600
                   else f"last {span} days")
 
@@ -295,7 +329,9 @@ def nvd_recent_cves(days=7):
             "published": (cve.get("published", "") or "")[:10],
         })
     out.sort(key=lambda c: c["published"], reverse=True)
-    return out[:80]
+    out = out[:80]
+    _cve_save(out)
+    return out
 
 
 def cisa_kev():
@@ -366,7 +402,7 @@ def _norm_date(raw):
     if not raw:
         return ""
     if re.match(r"^\d{4}-\d{2}-\d{2}", raw):
-        return raw[:16]
+        return raw[:16].replace("T", " ")
     try:
         return parsedate_to_datetime(raw).strftime("%Y-%m-%d %H:%M")
     except Exception:
@@ -565,12 +601,14 @@ def _breach_fetch():
             "added": b.get("AddedDate") or "",
             "records": b.get("PwnCount"),
             "classes": ", ".join(b.get("DataClasses") or [])[:90],
+            "domain": (b.get("Domain") or "").lower(),
+            "desc": (b.get("Description") or "")[:400],
             "link": ("https://haveibeenpwned.com/PwnedWebsites#"
                      + urllib.parse.quote(b.get("Name") or "")),
             "source": "HIBP",
         })
     items.sort(key=lambda x: x.get("added") or "", reverse=True)
-    return items[:40]
+    return items
 
 
 def _breach_thread():
@@ -640,6 +678,756 @@ def breach_feed():
         pass
     items.sort(key=lambda x: x.get("sort") or "", reverse=True)
     return items[:14]
+
+
+# ------------------------------------------------------------- KH Watch
+# Cambodia-facing exposure watch. Every lane is a public surface:
+# Google/Bing news RSS, Reddit search JSON, Telegram public previews,
+# fxtwitter's public mirror of a post, and the ransomware feeds already
+# on this board. No Tor client and no paid API: leak-site claims reach
+# this panel through the mirrors those feeds republish.
+
+KH_TERMS = (
+    # country, provinces, scripts
+    "cambodia", "cambodian", "kampuchea", "khmer", "phnom penh",
+    "sihanoukville", "siem reap", "battambang", "kampong cham",
+    "kampong", "kandal", "preah sihanouk", "koh kong", "kratie",
+    "takeo", "pursat", "svay rieng", "mondulkiri", "ratanakiri",
+    ".gov.kh", ".com.kh", ".edu.kh", ".org.kh", ".net.kh",
+    "柬埔寨", "高棉", "កម្ពុជា",
+    # state
+    "cambodia securities exchange", "national bank of cambodia",
+    "ministry of interior", "ministry of commerce",
+    "ministry of environment", "misti", "ministry of education",
+    "ministry of health", "ministry of economy", "council of ministers",
+    "national employment agency", "nea.gov.kh", "moe.gov.kh",
+    "misti.gov.kh", "mptc", "telecom cambodia",
+    # finance / fintech
+    "aba bank", "acleda", "wing bank", "canadia bank", "j trust royal",
+    "cambodia post bank", "vattanac bank", "ftb bank", "maybank cambodia",
+    "sathapana", "amret", "hattha", "prasac", "chokchey",
+    "bakong", "khqr", "pi pay", "aba pay",
+    # telecom / isp / utilities
+    "cellcard", "smart axiata", "metfone", "seatel", "cootel",
+    "ezecom", "sabay", "electricite du cambodge",
+    # conglomerates / retail / gaming
+    "royal group", "chip mong", "prince group", "nagacorp", "nagaworld",
+    "sokha", "borey", "aeon mall cambodia", "tk avenue",
+    "angkor beer", "cambrew", "khmer beverages",
+    # travel / services
+    "cambodia airports", "angkor air", "sky angkor", "passapp",
+    "nham24", "foodpanda cambodia",
+    # education
+    "royal university of phnom penh", "institute of technology of cambodia",
+    "num cambodia",
+    # media
+    "khmer times", "phnom penh post", "vod cambodia", "cambojanews",
+)
+
+KH_LANES = ("RANSOM", "LEAK", "BREACH", "DARKWEB", "SOCIAL", "REPORT")
+
+# A KH mention alone is not a signal — an independence-day parade is not
+# intel. Require a compromise/exposure word too (unless the row is a
+# watchlisted post or a ransomware/HIBP record, which are forced).
+KH_SIGNAL_CJK = ("黑客", "入侵", "泄露", "勒索", "数据泄露", "网络攻击", "攻击")
+KH_STRONG_RE = re.compile(
+    r"\b(breach\w*|hack(?:ed|er|ers|ing)|ransom\w*|malware|trojan|"
+    r"infostealer|spyware|botnet|ddos|exfil\w*|credential\w*|"
+    r"password\w*|database|dark ?web|leak site|vulnerab\w*|"
+    r"cve-\d{4}-\d+|phish\w*|threat actor|data (?:leak|breach|dump)|"
+    r"records|rats?)\b", re.I)
+KH_WEAK_RE = re.compile(r"\b(leak\w*|attack\w*|exploit\w*|exposed|"
+                        r"hacktivist)\b", re.I)
+KH_DATA_RE = re.compile(r"\b(data|database|records|credentials|passwords|"
+                        r"users|customers|accounts|portal)\b", re.I)
+
+
+def _kh_signal(text):
+    """Strong breach word, or a weak verb backed by a data noun."""
+    t = text or ""
+    if KH_STRONG_RE.search(t):
+        return True
+    if any(w in t.lower() for w in KH_SIGNAL_CJK):
+        return True
+    return bool(KH_WEAK_RE.search(t) and KH_DATA_RE.search(t))
+
+# Ambiguous on their own: correct for Cambodia, but also every other
+# country's ministry. Only allowed through when the row is already
+# Cambodia-scoped (news query, country field, .kh domain).
+KH_GENERIC_TERMS = (
+    "ministry of health", "ministry of commerce", "ministry of interior",
+    "ministry of education", "ministry of economy", "council of ministers",
+    "national employment agency",
+)
+
+KH_LANE_HINTS = (
+    ("RANSOM", ("ransomware", "ransom", "lockbit", "akira", "clop",
+                "leak site", "extort", "blackcat", "勒索")),
+    ("LEAK", ("leak", "dump", "database", "db dump", "records",
+              "exfil", "for sale", "sold", "combolist", "credentials",
+              "passwords", "dataset", "data set", "泄露", "数据")),
+    ("BREACH", ("breach", "compromis", "hack", "intrusion",
+                "unauthorized", "exposed", "黑客", "入侵")),
+    ("DARKWEB", ("dark web", "darkweb", "onion", "forum", "broker",
+                 "initial access", "threat actor", "underground",
+                 "scam", "fraud")),
+)
+
+KH_NEWS_Q = (
+    ("Cambodia data breach", "en-US", "US", "US:en"),
+    ("Cambodia leak hacker", "en-US", "US", "US:en"),
+    ("Cambodia ransomware", "en-US", "US", "US:en"),
+    ("Cambodia database exposed", "en-US", "US", "US:en"),
+    ("Cambodia hacked", "en-US", "US", "US:en"),
+    ("Cambodia cyber attack", "en-US", "US", "US:en"),
+    ("Cambodian bank data breach", "en-US", "US", "US:en"),
+    ("Cambodia scam compound data leak", "en-US", "US", "US:en"),
+    ("柬埔寨 数据 泄露", "zh-CN", "CN", "CN:zh-Hans"),
+    ("柬埔寨 黑客 入侵", "zh-CN", "CN", "CN:zh-Hans"),
+    ("柬埔寨 网络攻击", "zh-CN", "CN", "CN:zh-Hans"),
+    ("កម្ពុជា ទិន្នន័យ", "km", "KH", "KH:km"),
+)
+
+# Cambodian newsrooms that answer keylessly. Phnom Penh Post sits behind
+# Cloudflare and Kiripost renders client-side, so both are skipped.
+KH_FEEDS = (
+    ("Khmer Times", "https://www.khmertimeskh.com/feed/"),
+    ("VOD English", "https://vodenglish.news/feed/"),
+    ("CamboJA", "https://cambojanews.com/feed/"),
+)
+
+KH_TG = tuple(c.strip() for c in os.environ.get(
+    "KH_TELEGRAM_CHANNELS",
+    "falconfeedsio,databreaches,leakbase,CyberSecurityTechnologies"
+).split(",") if c.strip())
+
+KH_SEED_POSTS = tuple(u.strip() for u in os.environ.get(
+    "KH_WATCH_POSTS",
+    "https://x.com/DailyDarkWeb/status/2120953398006837629,"
+    "https://x.com/VECERTRadar/status/2118895424433987877"
+).split(",") if u.strip())
+
+# Accounts whose KH posts should be hunted by site-scoped index queries.
+KH_X_ACCOUNTS = tuple(a.strip().lstrip("@") for a in os.environ.get(
+    "KH_X_ACCOUNTS",
+    "VECERTRadar,DailyDarkWeb,DarkWebInformer,CyberThreatLine,"
+    "FalconFeedsio,HackManac,ThreatMon,ransomwatch"
+).split(",") if a.strip())
+
+# X has no keyless search API. This lane goes through the search index
+# (DuckDuckGo lite), then resolves each indexed status URL through
+# fxtwitter. The index throttles datacenter IPs, so queries rotate one
+# per sweep, results persist on disk, and a 202 buys a 30-minute backoff.
+KH_X_QUERIES = tuple(q.strip() for q in os.environ.get(
+    "KH_X_QUERIES",
+    "dark web cambodia,cambodia data leak,cambodia breach,"
+    "cambodia ransomware,cambodia hacker"
+).split(",") if q.strip())
+
+X_SEARCH_CACHE = os.path.join(HERE, "x_search_cache.json")
+X_SEARCH_BACKOFF = 30 * 60
+
+# Reddit's own JSON/RSS endpoints 403 or 429 datacenter IPs, so this lane
+# rides Arctic Shift's public Reddit archive instead: keyless, no auth,
+# full-text search scoped to a subreddit. It times out under load, so
+# results persist and a failure buys a 20-minute backoff.
+REDDIT_CACHE = os.path.join(HERE, "reddit_cache.json")
+REDDIT_BACKOFF = 10 * 60
+
+
+KH_REDDIT_SUBS = tuple(s.strip() for s in os.environ.get(
+    "KH_REDDIT_SUBS",
+    # low-volume subs first: 100 recent posts there spans weeks, so a
+    # Cambodia mention is actually findable by recency alone
+    "DataBreach,ransomware,threatintel,blueteamsec,scambait,"
+    "netsec,cybersecurity,darknet,privacy"
+).split(",") if s.strip())
+
+KH_REDDIT_Q = ("cambodia", "khmer")
+
+# A subreddit post is not Cambodia-scoped context, so it must name a cyber
+# mechanism itself. Without this, "breach of contract" and robbery stories
+# from r/cambodia read as data breaches.
+KH_CYBER_RE = re.compile(
+    r"\b(hack\w*|ransom\w*|malware|trojan|infostealer|spyware|botnet|"
+    r"ddos|exfil\w*|credential\w*|password\w*|database|dark ?web|"
+    r"leak ?site|vulnerab\w*|cve-\d{4}-\d+|phish\w*|threat actor|"
+    r"data (?:leak|breach|dump)|cyber\w*|scam\w* compound|"
+    r"infosec|opsec)\b", re.I)
+
+
+def _kh_hit_strict(text):
+    """KH hit that ignores generic ministries/banks.
+
+    The global ransomware feed is not Cambodia-scoped, so "Ministry of
+    Health" alone put Malaysia's MoH in this panel. Only a uniquely
+    Cambodian term (or the KH country field) may admit a row from it.
+    """
+    t = (text or "").lower()
+    for term in KH_GENERIC_TERMS:
+        t = t.replace(term, " ")
+    return _kh_hit(t)
+
+
+KH_TERM_RE = re.compile(
+    r"(?<![a-z0-9])("
+    + "|".join(re.escape(t) for t in KH_TERMS if "." not in t)
+    + r")(?![a-z0-9])", re.I)
+KH_TERM_RAW = tuple(t for t in KH_TERMS if "." in t)
+
+
+def _kh_hit(text):
+    """First KH term present in the text, or ''.
+
+    Word boundaries matter: a bare substring check made "takeo" hit
+    "account takeover" and put a French credential-stuffing list in a
+    Cambodian breach panel.
+    """
+    t = (text or "").lower()
+    m = KH_TERM_RE.search(t)
+    if m:
+        return m.group(1)
+    for term in KH_TERM_RAW:
+        if term in t:
+            return term
+    return ""
+
+
+KH_CONFLICT_RE = re.compile(
+    r"(tarnish|accus\w+|den(?:y|ies)|retaliat\w+|"
+    r"strengthen\w* (?:cyber|defen\w+)|"
+    r"cyber (?:conflict|escalation|warfare|war)|state-sponsored|"
+    r"claims? (?:it|that)|military|border)", re.I)
+
+
+def _kh_lane(title, source=""):
+    t = (title or "").lower()
+    if any(w in t for w in ("hacktivist", "cyber conflict",
+                            "cyber escalation", "cyber warfare",
+                            "state-sponsored", "tarnish")):
+        return "REPORT"
+    if KH_CONFLICT_RE.search(t) and "thailand" in t:
+        return "REPORT"
+    for lane, words in KH_LANE_HINTS:
+        if any(w in t for w in words):
+            return lane
+    s = (source or "").lower()
+    if any(w in s for w in ("x.com", "twitter", "telegram", "facebook",
+                            "reddit")):
+        return "SOCIAL"
+    return "REPORT"
+
+
+def _gnews(q, hl, gl, ceid):
+    url = ("https://news.google.com/rss/search?q="
+           + urllib.parse.quote_plus(q)
+           + f"&hl={hl}&gl={gl}&ceid={ceid}")
+    out = []
+    for i in parse_feed(fetch_url(url, headers={"User-Agent": "Mozilla/5.0"})):
+        title = re.sub(r"\s+-\s+[^-]{2,42}$", "", i["title"]).strip()
+        out.append({**i, "title": title})
+    return out
+
+
+def _bing_news(q):
+    url = ("https://www.bing.com/news/search?q="
+           + urllib.parse.quote_plus(q) + "&format=RSS")
+    return parse_feed(fetch_url(url, headers={"User-Agent": "Mozilla/5.0"}))
+
+
+def _reddit_load():
+    try:
+        with open(REDDIT_CACHE, encoding="utf-8") as f:
+            st = json.load(f)
+        if isinstance(st, dict):
+            st.setdefault("next", 0)
+            st.setdefault("items", [])
+            st.setdefault("blocked", 0)
+            return st
+    except Exception:
+        pass
+    return {"next": 0, "items": [], "blocked": 0}
+
+
+def _reddit_save(st):
+    try:
+        with open(REDDIT_CACHE, "w", encoding="utf-8") as f:
+            json.dump(st, f)
+    except Exception:
+        pass
+
+
+def _arctic(sub, query=None, limit=100):
+    """Arctic Shift: one subreddit, optional full-text query."""
+    url = ("https://arctic-shift.photon-reddit.com/api/posts/search"
+           "?subreddit=" + urllib.parse.quote(sub)
+           + f"&limit={limit}&sort=desc")
+    if query:
+        url += "&query=" + urllib.parse.quote_plus(query)
+    raw = json.loads(fetch_url(url, timeout=30).decode("utf-8", "replace"))
+    if raw.get("error"):
+        raise RuntimeError(str(raw["error"]))
+    return raw.get("data") or []
+
+
+def _reddit_kh():
+    """r/cambodia every sweep (both queries), plus two rotating subs."""
+    st = _reddit_load()
+    now = time.time()
+    if now < float(st.get("blocked") or 0):
+        return st.get("items") or []
+    subs = list(KH_REDDIT_SUBS)
+    if not subs:
+        return st.get("items") or []
+
+    idx = int(st.get("next", 0))
+    # One request per sweep, alternating: r/cambodia by recency (where a
+    # Cambodian breach post actually lands) and a rotating discovery call
+    # (full-text query, or recency from a low-volume sub). Arctic Shift
+    # 422s on bursts and on large limits, so no two calls share a sweep.
+    if idx % 2 == 0:
+        plan = [("cambodia", None, 50)]
+    else:
+        pool = [("cambodia", q, 25) for q in
+                ("breach", "hack", "leak", "ransomware", "data", "phishing")]
+        pool += [(s, None, 50) for s in subs]
+        plan = [pool[(idx // 2) % len(pool)]]
+
+    fresh, failed, search_failed = [], None, False
+    for sub, q, lim in plan:
+        try:
+            fresh.extend(_arctic(sub, q, lim))
+        except Exception as exc:
+            if q:
+                search_failed = True
+                print(f"  [-] reddit search r/{sub} '{q}': {exc} "
+                      f"(paused 30m)", flush=True)
+            else:
+                failed = f"r/{sub}: {exc}"
+                print(f"  [-] reddit {failed}", flush=True)
+            break
+
+    rows = []
+    for p in fresh:
+        if p.get("removed_by_category") or (p.get("author") in
+                                            ("[deleted]", None)):
+            continue
+        title = re.sub(r"\s+", " ", p.get("title") or "").strip()
+        body = re.sub(r"<[^>]+>", " ", p.get("selftext") or "")
+        blob = title + " " + body
+        sub = (p.get("subreddit") or "").lower()
+        if not KH_CYBER_RE.search(blob):
+            continue
+        if sub != "cambodia" and not _kh_hit(blob):
+            continue
+        ts = p.get("created_utc") or 0
+        rows.append({
+            "title": title,
+            "link": "https://www.reddit.com" + (p.get("permalink") or ""),
+            "date": datetime.fromtimestamp(
+                ts, timezone.utc).strftime("%Y-%m-%d %H:%M"),
+            "source": "reddit/r/" + (p.get("subreddit") or "?"),
+            "body": body[:500],
+        })
+
+    merged = {i.get("link"): i for i in (st.get("items") or [])
+              if i.get("link")}
+    for r in rows:
+        if r.get("link"):
+            merged[r["link"]] = r
+    items = sorted(merged.values(),
+                   key=lambda x: x.get("date") or "", reverse=True)[:120]
+    st.update({"next": idx + 1, "items": items,
+               "blocked": now + REDDIT_BACKOFF if failed else 0,
+               "qdown": (now + 30 * 60) if search_failed else 0})
+    _reddit_save(st)
+    print(f"  [+] reddit: {len(fresh)} fetched, {len(rows)} KH-relevant, "
+          f"{len(items)} cached"
+          f"{' (backoff)' if failed else ''}"
+          f"{' (search paused)' if search_failed else ''}", flush=True)
+    return items
+
+
+def _telegram_kh(chan):
+    html = fetch_url(f"https://t.me/s/{chan}", timeout=20, headers={
+        "User-Agent": "Mozilla/5.0"}).decode("utf-8", "replace")
+    out = []
+    for blk in re.split(r'<div class="tgme_widget_message_wrap', html)[1:]:
+        m = re.search(
+            r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>',
+            blk, re.S)
+        if not m:
+            continue
+        body = unescape(re.sub(
+            r"<[^>]+>", " ", re.sub(r"<br\s*/?>", "\n", m.group(1))))
+        body = re.sub(r"[ \t]+", " ", body).strip()
+        if not body:
+            continue
+        dm = re.search(r'<time[^>]*datetime="([^"]+)"', blk)
+        pm = re.search(r'data-post="([^"]+)"', blk)
+        out.append({
+            "title": body.split("\n")[0][:180],
+            "body": body[:600],
+            "link": ("https://t.me/" + pm.group(1)) if pm
+                    else f"https://t.me/s/{chan}",
+            "date": _norm_date(dm.group(1)) if dm else "",
+            "source": f"Telegram/{chan}",
+        })
+    return out
+
+
+def _x_post(url):
+    m = re.search(r"(?:x|twitter)\.com/([^/]+)/status/(\d+)", url or "")
+    if not m:
+        return []
+    user, sid = m.group(1), m.group(2)
+    raw = json.loads(fetch_url(
+        f"https://api.fxtwitter.com/{user}/status/{sid}",
+        headers={"User-Agent": "Mozilla/5.0"}).decode("utf-8", "replace"))
+    tw = raw.get("tweet") or {}
+    text = (tw.get("text") or "").strip()
+    if not text:
+        return []
+    return [{
+        "title": re.sub(r"\s+", " ", text.split("\n")[0])[:180],
+        "body": text[:800],
+        "link": tw.get("url") or url,
+        "date": _norm_date(tw.get("created_at") or ""),
+        "source": "x.com/" + ((tw.get("author") or {}).get("screen_name")
+                              or user),
+        "force": True,
+    }]
+
+
+def _x_search():
+    tok = os.environ.get("X_BEARER_TOKEN")
+    if not tok:
+        return []
+    q = ("(cambodia OR khmer OR 柬埔寨) "
+         "(breach OR leak OR hacked OR ransomware OR database) -is:retweet")
+    url = ("https://api.x.com/2/tweets/search/recent?max_results=25"
+           "&tweet.fields=created_at,author_id&query="
+           + urllib.parse.quote(q))
+    raw = json.loads(fetch_url(url, headers={
+        "Authorization": "Bearer " + tok}).decode("utf-8", "replace"))
+    out = []
+    for t in raw.get("data") or []:
+        out.append({
+            "title": re.sub(r"\s+", " ", (t.get("text") or ""))[:180],
+            "body": t.get("text") or "",
+            "link": f"https://x.com/i/web/status/{t.get('id')}",
+            "date": _norm_date(t.get("created_at") or ""),
+            "source": "x.com",
+        })
+    return out
+
+
+def _xsearch_load():
+    try:
+        with open(X_SEARCH_CACHE, encoding="utf-8") as f:
+            st = json.load(f)
+        if isinstance(st, dict):
+            st.setdefault("next", 0)
+            st.setdefault("items", [])
+            st.setdefault("blocked", 0)
+            return st
+    except Exception:
+        pass
+    return {"next": 0, "items": [], "blocked": 0}
+
+
+def _xsearch_save(st):
+    try:
+        with open(X_SEARCH_CACHE, "w", encoding="utf-8") as f:
+            json.dump(st, f)
+    except Exception:
+        pass
+
+
+def _ddg_x(query, limit=6):
+    """DuckDuckGo lite -> indexed x.com status URLs. Raises when throttled."""
+    term = (query if query.lower().startswith("site:")
+            else "site:x.com " + query)
+    q = urllib.parse.quote_plus(term)
+    html = fetch_url("https://lite.duckduckgo.com/lite/?q=" + q,
+                     timeout=25, headers={"User-Agent": DDG_UA}
+                     ).decode("utf-8", "replace")
+    if "result-link" not in html:
+        raise RuntimeError("no result rows (throttled or empty)")
+    hits, seen = [], set()
+    for m in re.finditer(
+            r"<a[^>]+href=['\"]([^'\"]+)['\"][^>]*"
+            r"class=['\"]result-link['\"][^>]*>(.*?)</a>", html, re.S):
+        href = m.group(1)
+        dm = re.search(r"uddg=([^&]+)", href)
+        if dm:
+            href = urllib.parse.unquote(dm.group(1))
+        tm = re.search(r"(?:x|twitter)\.com/([^/]+)/status/(\d+)", href)
+        if not tm:
+            continue
+        sid = tm.group(2)
+        if sid in seen:
+            continue
+        seen.add(sid)
+        hits.append({
+            "url": f"https://x.com/{tm.group(1)}/status/{sid}",
+            "title": unescape(re.sub(r"<[^>]+>", "", m.group(2))).strip(),
+        })
+        if len(hits) >= limit:
+            break
+    return hits
+
+
+def _x_queries():
+    """Keyword queries plus one site-scoped query per watched account."""
+    qs = list(KH_X_QUERIES)
+    qs += [f"site:x.com/{a} cambodia" for a in KH_X_ACCOUNTS]
+    return qs
+
+
+def _x_search_ddg():
+    """Rotate one query per sweep, resolve hits, keep the last good set."""
+    st = _xsearch_load()
+    now = time.time()
+    if now < float(st.get("blocked") or 0):
+        return st.get("items") or []
+    qs = _x_queries()
+    if not qs:
+        return st.get("items") or []
+    q = qs[int(st.get("next", 0)) % len(qs)]
+    try:
+        hits = _ddg_x(q)
+    except Exception as exc:
+        print(f"  [-] KH/x search '{q}': {exc} (backoff 30m)", flush=True)
+        st["blocked"] = now + X_SEARCH_BACKOFF
+        st["next"] = int(st.get("next", 0)) + 1
+        _xsearch_save(st)
+        return st.get("items") or []
+
+    resolved, stubs = [], []
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        futs = [(h, pool.submit(_x_post, h["url"])) for h in hits]
+        for h, fut in futs:
+            try:
+                got = fut.result(timeout=25) or []
+            except Exception:
+                got = []
+            if got:
+                resolved.extend(got)
+            else:
+                stubs.append({"title": h["title"], "link": h["url"],
+                              "date": "", "source": "x.com",
+                              "body": h["title"]})
+
+    merged = {i.get("link"): i for i in (st.get("items") or [])
+              if i.get("link")}
+    for r in resolved + stubs:
+        if r.get("link"):
+            merged[r["link"]] = r
+    items = sorted(merged.values(),
+                   key=lambda x: x.get("date") or "", reverse=True)[:120]
+    st.update({"next": int(st.get("next", 0)) + 1, "items": items,
+               "blocked": 0})
+    _xsearch_save(st)
+    print(f"  [+] KH/x search '{q}': {len(hits)} indexed, "
+          f"{len(resolved)} resolved, {len(items)} cached", flush=True)
+    return items
+
+
+def watch_post(url):
+    """Pin one X post into KH Watch immediately (GET /watch?url=...)."""
+    try:
+        rows = _x_post(url)
+    except Exception as exc:
+        return {"status": "error", "detail": str(exc)}
+    if not rows:
+        return {"status": "unresolved", "url": url}
+    row = rows[0]
+    st = _xsearch_load()
+    merged = {i.get("link"): i for i in (st.get("items") or [])
+              if i.get("link")}
+    merged[row["link"]] = row
+    st["items"] = sorted(merged.values(),
+                         key=lambda x: x.get("date") or "",
+                         reverse=True)[:80]
+    _xsearch_save(st)
+    with DATA_LOCK:
+        cur = list(DATA.get("kh") or [])
+        if not any((i.get("link") or "") == row["link"] for i in cur):
+            title = row.get("title") or ""
+            cur.append({
+                "title": title, "link": row["link"],
+                "date": row.get("date") or "",
+                "source": row.get("source") or "x.com",
+                "lane": _kh_lane(title, row.get("source") or ""),
+                "term": _kh_hit(title) or "watchlist",
+            })
+            cur.sort(key=lambda x: x.get("date") or "", reverse=True)
+            DATA["kh"] = cur[:60]
+    return {"status": "pinned", "title": row.get("title"),
+            "date": row.get("date"), "link": row["link"]}
+
+
+def _fb_pages():
+    """Optional: Facebook Page posts via Graph API (needs a token)."""
+    tok = os.environ.get("FB_ACCESS_TOKEN")
+    pages = [p.strip() for p in os.environ.get("KH_FB_PAGES", "").split(",")
+             if p.strip()]
+    if not (tok and pages):
+        return []
+    out = []
+    for pid in pages:
+        url = (f"https://graph.facebook.com/v19.0/"
+               f"{urllib.parse.quote(pid)}/posts"
+               f"?fields=message,created_time,permalink_url&limit=25"
+               f"&access_token={urllib.parse.quote(tok)}")
+        raw = json.loads(fetch_url(url).decode("utf-8", "replace"))
+        for p in raw.get("data") or []:
+            msg = p.get("message") or ""
+            if not msg:
+                continue
+            out.append({
+                "title": re.sub(r"\s+", " ", msg.split("\n")[0])[:180],
+                "body": msg[:600],
+                "link": p.get("permalink_url") or "",
+                "date": _norm_date(p.get("created_time") or ""),
+                "source": f"facebook/{pid}",
+            })
+    return out
+
+
+def _kh_feed(name, url):
+    """A Cambodian newsroom: no KH term needed, but a breach word is."""
+    out = []
+    for i in parse_feed(fetch_url(url, timeout=25,
+                                  headers={"User-Agent": DDG_UA})):
+        blob = i.get("title") or ""
+        if _kh_signal(blob):
+            out.append({**i, "source": name, "force": True})
+    return out
+
+
+KH_VICTIMS = {"at": 0.0, "items": []}
+
+
+def _rf_country_kh():
+    """ransomware.live country index for KH (1 req/min, so cache 1h)."""
+    if KH_VICTIMS["items"] and time.time() - KH_VICTIMS["at"] < 3600:
+        return list(KH_VICTIMS["items"])
+    raw = json.loads(fetch_url(
+        "https://api.ransomware.live/v2/countryvictims/KH",
+        timeout=25).decode("utf-8", "replace"))
+    if isinstance(raw, dict):  # {"message": "1 per 1 minute"} under throttle
+        raw = raw.get("victims") or []
+    out = []
+    for e in raw:
+        out.append({
+            "gang": (e.get("group_name") or e.get("group")
+                     or "unknown").casefold(),
+            "victim": (e.get("post_title") or e.get("victim")
+                       or e.get("domain") or e.get("website") or "unknown"),
+            "country": e.get("country") or "KH",
+            "date": (e.get("discovered") or e.get("attackdate") or "")[:10],
+            "url": (e.get("post_url") or e.get("claim_url")
+                    or e.get("url") or ""),
+            "activity": e.get("activity") or "",
+            "site": e.get("website") or "",
+        })
+    if out:
+        KH_VICTIMS.update({"at": time.time(), "items": out})
+    return out
+
+
+def kh_watch(attacks=None, breaches=None):
+    """Merge every KH-facing public lane into one newest-first feed."""
+    attacks, breaches = attacks or [], breaches or []
+    items, seen = [], set()
+
+    def add(title, link, date, source, hay="", force=False, lane=None):
+        title = re.sub(r"\s+", " ", (title or "")).strip()
+        if not title:
+            return
+        blob = title + " " + (hay or "")
+        hit = _kh_hit(blob)
+        if not hit and not force:
+            return
+        if not force and not _kh_signal(blob):
+            return
+        key = re.sub(r"[^a-z0-9]+", "", title.lower())[:70]
+        if not key or key in seen:
+            return
+        seen.add(key)
+        items.append({
+            "title": title[:220], "link": link or "",
+            "date": (date or "")[:16], "source": source or "wire",
+            "lane": lane or _kh_lane(title, source),
+            "term": hit or "watchlist",
+        })
+
+    jobs = []
+    for q, hl, gl, ceid in KH_NEWS_Q:
+        jobs.append(("Google News",
+                     lambda q=q, hl=hl, gl=gl, ceid=ceid:
+                     _gnews(q, hl, gl, ceid)))
+    jobs.append(("Bing News", lambda: _bing_news("Cambodia data breach")))
+    jobs.append(("Bing News", lambda: _bing_news("Cambodia hacked")))
+    for name, feed in KH_FEEDS:
+        jobs.append((name, lambda n=name, f=feed: _kh_feed(n, f)))
+    if os.environ.get("KH_REDDIT", "1") != "0":
+        jobs.append(("Reddit", _reddit_kh))
+    for chan in KH_TG:
+        jobs.append((f"Telegram/{chan}", lambda c=chan: _telegram_kh(c)))
+    for u in KH_SEED_POSTS:
+        jobs.append(("x.com", lambda u=u: _x_post(u)))
+    jobs.append(("x.com", _x_search))
+    jobs.append(("x.com search", _x_search_ddg))
+    jobs.append(("facebook", _fb_pages))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futs = [(src, pool.submit(fn)) for src, fn in jobs]
+        for src, fut in futs:
+            try:
+                rows = fut.result(timeout=45) or []
+            except Exception as exc:
+                print(f"  [-] KH/{src}: {exc}", flush=True)
+                continue
+            for r in rows:
+                add(r.get("title"), r.get("link"), r.get("date"),
+                    r.get("source") or src, r.get("body") or "",
+                    r.get("force", False), r.get("lane"))
+
+    try:
+        kh_victims = _rf_country_kh()
+        print(f"  [+] KH/ransom country: {len(kh_victims)} KH victims",
+              flush=True)
+    except Exception as exc:
+        print(f"  [-] KH/ransom country: {exc}", flush=True)
+        kh_victims = []
+
+    for a in attacks + kh_victims:
+        hay = " ".join(str(a.get(k) or "") for k in
+                       ("victim", "country", "gang", "activity"))
+        if (str(a.get("country") or "").upper() in ("KH", "KHM", "CAMBODIA")
+                or _kh_hit_strict(hay)):
+            add(f"{a.get('gang', '?')} claims {a.get('victim', '?')}",
+                a.get("url") or "", a.get("date") or "",
+                "ransomware.live", hay=hay, force=True, lane="RANSOM")
+
+    with B_LOCK:
+        catalog = list(B.get("breaches") or [])
+    for b in list(breaches or []) + catalog:
+        hay = " ".join(str(b.get(k) or "") for k in
+                       ("org", "title", "domain", "desc", "classes"))
+        if _kh_hit(hay):
+            src = ("HIBP" if b.get("source") == "HIBP"
+                   or b.get("kind") == "catalog" else "DataBreaches.net")
+            add(b.get("org") or b.get("title") or "", b.get("link") or "",
+                b.get("date") or "", src, hay=hay, lane="BREACH")
+
+    order = {lane: i for i, lane in enumerate(KH_LANES)}
+    items.sort(key=lambda x: (x["date"], -order.get(x["lane"], 9)),
+               reverse=True)
+    return items[:120]
 
 
 # ------------------------------------------------------------------ engine
@@ -721,7 +1509,7 @@ def refresh_once():
             print(f"  [-] {name}: {exc} — keeping previous data", flush=True)
             k = key_of.get(name)
             if k == "cves" and not cves:
-                cves = prev.get("cves") or []
+                cves = prev.get("cves") or _cve_load() or []
             elif k == "kev" and not kev:
                 kev = prev.get("kev") or []
             elif k == "attacks" and not attacks:
@@ -733,6 +1521,14 @@ def refresh_once():
             elif not news:
                 news = prev.get("news") or []
 
+    try:
+        kh = kh_watch(attacks, breach)
+        print(f"  [+] KH Watch: {len(kh)} cambodia signals", flush=True)
+    except Exception as exc:
+        kh = prev.get("kh") or []
+        errors.append(f"KH Watch: {exc} (kept last good data)")
+        print(f"  [-] KH Watch: {exc} — keeping previous data", flush=True)
+
     with DATA_LOCK:
         DATA["cves"] = cves
         DATA["kev"] = kev
@@ -740,6 +1536,7 @@ def refresh_once():
         DATA["attacks"] = attacks[:20]
         DATA["ai"] = ai
         DATA["breach"] = breach
+        DATA["kh"] = kh
         DATA["updated"] = datetime.now(
             timezone(timedelta(hours=7))).strftime("%Y-%m-%d %H:%M ICT")
         DATA["errors"] = errors
@@ -753,7 +1550,7 @@ def refresh_once():
     edb_tick()
     print(f"[*] sweep done: {len(cves)} cves, {len(kev)} kev, "
           f"{len(attacks)} victims, {len(ai)} ai, "
-          f"{len(breach)} breach, {len(news)} news",
+          f"{len(breach)} breach, {len(kh)} kh, {len(news)} news",
           flush=True)
 
 
@@ -911,6 +1708,29 @@ h1 .dot{color:var(--red)}
 .p-breach .ph .ic{color:var(--amber);background:rgba(255,176,32,.12)}
 .p-breach::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
   background:linear-gradient(90deg,var(--amber),transparent 70%)}
+.p-kh .ph .ic{color:var(--rose);background:rgba(255,95,158,.12)}
+.p-kh::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;
+  background:linear-gradient(90deg,var(--rose),var(--red) 42%,transparent 80%)}
+.khctl input{min-width:240px}
+.khlane{display:inline-block;font-family:var(--mono);font-size:.6rem;
+  letter-spacing:.9px;padding:1px 6px;border-radius:4px;margin-right:7px;
+  border:1px solid transparent;vertical-align:1px}
+.kh-RANSOM{color:var(--rose);background:rgba(255,95,158,.12);
+  border-color:rgba(255,95,158,.45)}
+.kh-LEAK{color:var(--red);background:rgba(255,59,92,.12);
+  border-color:rgba(255,59,92,.45)}
+.kh-BREACH{color:var(--orange);background:rgba(255,148,48,.12);
+  border-color:rgba(255,148,48,.45)}
+.kh-DARKWEB{color:var(--violet);background:rgba(167,139,250,.12);
+  border-color:rgba(167,139,250,.45)}
+.kh-SOCIAL{color:var(--cyan);background:rgba(34,210,238,.11);
+  border-color:rgba(34,210,238,.4)}
+.kh-REPORT{color:var(--dim);background:rgba(131,156,201,.1);
+  border-color:rgba(131,156,201,.35)}
+.khsub{font-size:.64rem;color:var(--dim);margin-top:3px;
+  font-family:var(--mono)}
+.khnote{font-size:.66rem;color:var(--faint);padding:8px 18px 2px;
+  font-family:var(--mono);line-height:1.5}
 .p-gloss .ph .ic{color:var(--violet);background:rgba(167,139,250,.12)}
 /* glossary button + hover card */
 .gloss-wrap{position:relative;display:inline-block}
@@ -943,6 +1763,7 @@ h1 .dot{color:var(--red)}
 .panel:not(.p-cve):not(.p-edb) .ulu{max-height:40vh}
 .p-edb .ulu{max-height:40vh}
 .p-news .ulu{max-height:34vh}
+.p-kh .ulu{max-height:56vh}
 .ulu li{padding:10.5px 7px;font-size:.85rem;line-height:1.55;cursor:default;
   border-bottom:1px solid rgba(26,39,69,.5);border-radius:7px;
   transition:background .14s,transform .14s;border-left:2px solid transparent}
@@ -1096,6 +1917,22 @@ if(rb){rb.addEventListener('click',async()=>{
   };
   setTimeout(poll,3000);
 });}
+const khItems=document.querySelectorAll('#kh>li');
+let khLane='ALL';
+const khApply=()=>{
+  const el=document.getElementById('khq');
+  const q=(el?el.value:'').toLowerCase();
+  khItems.forEach(li=>{
+    const ok=(khLane==='ALL'||li.dataset.lane===khLane)&&
+      (li.dataset.q||'').includes(q);
+    li.style.display=ok?'':'none';});};
+document.querySelectorAll('.chip[data-kh]').forEach(c=>{
+  c.addEventListener('click',()=>{
+    document.querySelectorAll('.chip[data-kh]').forEach(
+      x=>x.classList.remove('active'));
+    c.classList.add('active');khLane=c.dataset.kh;khApply();});});
+const khq=document.getElementById('khq');
+if(khq){khq.addEventListener('input',khApply);}
 """
 
 HTML_HEAD = """<!DOCTYPE html>
@@ -1140,6 +1977,7 @@ __ERROR_BOX__
 <footer class="footer">
   <b>sources</b> &mdash; NVD 2.0 &middot; CISA KEV &middot; Exploit-DB index &middot; ransomware.live &middot; ransomfeed.it
   &middot; The Hacker News &middot; BleepingComputer &middot; Krebs on Security &middot; VentureBeat AI &middot; The Decoder &middot; MarkTechPost &middot; r/MachineLearning &middot; HIBP &middot; DataBreaches.net<br>
+  <b>KH Watch</b> &mdash; Google News &middot; Bing News &middot; Reddit &middot; Telegram public mirrors &middot; fxtwitter &middot; ransomware feeds &middot; HIBP
   zero dependencies &middot; python stdlib only &middot; reloads every 60s &middot; feeds roll every 15 min
 </footer>
 <script>__JS__</script>
@@ -1166,6 +2004,7 @@ def render():
     cves, kev, attacks = d["cves"], d["kev"], d["attacks"]
     gangs, news, ai = d["gangs"], d["news"], d["ai"]
     breach = d["breach"]
+    kh = d.get("kh") or []
     updated = d["updated"] or "booting..."
     errors = d["errors"]
 
@@ -1190,6 +2029,7 @@ def render():
             "of these CVEs indexed"),
         kpi("lime", "lime", "AI Wire", len(ai), "laned headlines"),
         kpi("amber", "amber", "Breaches", len(breach), "hibp · wire"),
+        kpi("rose", "rose", "KH signals", len(kh), "cambodia watch"),
         kpi("orange", "orange", "Gangs active", len(gangs), "24h"),
         kpi("teal", "teal", "New victims", len(attacks), "claimed"),
         kpi("sky", "sky", "Headlines", len(news), "crawled"),
@@ -1210,6 +2050,59 @@ def render():
                      ("yellow", n_med), ("green", n_low)))
     mixleg += ("<span><i class='sw' style='background:var(--faint)'></i>"
                f"other {n_other}</span>")
+
+    # ---- KH Watch ----------------------------------------------
+    KH_TIP = {
+        "RANSOM": "leak-site victim claim",
+        "LEAK": "database / dump offered or published",
+        "BREACH": "compromise claimed or confirmed",
+        "DARKWEB": "dark-web / forum chatter",
+        "SOCIAL": "public social post",
+        "REPORT": "press / wire coverage",
+    }
+    kh_counts = Counter(k["lane"] for k in kh)
+    kh_ctl = ("<div class='plctl khctl'>"
+              "<input id='khq' type='text' placeholder='filter KH signals "
+              "&mdash; victim / actor / keyword'>"
+              + "".join(
+                  f"<button class='chip"
+                  f"{' active' if lane == 'ALL' else ''}' "
+                  f"data-kh='{lane}'>{lane} <b>"
+                  f"{len(kh) if lane == 'ALL' else kh_counts.get(lane, 0)}"
+                  f"</b></button>"
+                  for lane in ("ALL",) + KH_LANES)
+              + "</div>")
+
+    kh_html = ""
+    for k in kh:
+        q = (k["title"] + " " + k["source"]).lower()
+        title_html = (
+            f"<a href='{escape(k['link'])}' target='_blank' rel='noopener'>"
+            f"{escape(k['title'])}</a>" if k["link"]
+            else f"<span>{escape(k['title'])}</span>")
+        kh_html += (
+            f"<li data-lane='{escape(k['lane'])}' "
+            f"data-q='{escape(q, quote=True)}'>"
+            f"<span class='date'>{escape(k['date'])}</span>"
+            f"<span class='khlane kh-{escape(k['lane'])}' "
+            f"title='{escape(KH_TIP.get(k['lane'], ''), quote=True)}'>"
+            f"{escape(k['lane'])}</span>"
+            f"{title_html}"
+            f"<div class='khsub'>[{escape(k['source'])}]"
+            f" &middot; match: {escape(k['term'])}</div></li>")
+    kh_html = kh_html or (
+        "<li class='empty'>No Cambodia signals yet &mdash; the first sweep "
+        "builds them (Google/Bing news, Reddit, Telegram mirrors, "
+        "fxtwitter, ransomware feeds).</li>")
+    xq = (urllib.parse.quote(KH_X_QUERIES[0]) if KH_X_QUERIES
+          else "dark%20web%20cambodia")
+    kh_note = ("<div class='khnote'>public OSINT only &middot; no Tor "
+               "client &middot; leak-site claims arrive through the "
+               "ransomware feeds and public Telegram mirrors &middot; "
+               "actor claims are unverified by definition &middot; "
+               f"<a href='https://x.com/search?q={xq}&src=typed_query&f=top' "
+               "target='_blank' rel='noopener'>open this search on X "
+               "&nearr;</a></div>")
 
     # ---- panels ------------------------------------------------
     kev_html = ""
@@ -1432,7 +2325,10 @@ def render():
                "+ EDB POC</button></div>")
 
     panels = (
-        panel("p-kev s4", "&#9888;", "Known Exploited", "CISA KEV", len(kev),
+        panel("p-kh s12", "&#127472;&#127469;", "KH Watch",
+              "cambodia · leak · breach · darkweb · social", len(kh),
+              kh_html, kh_ctl + kh_note, ul_id="kh")
+        + panel("p-kev s4", "&#9888;", "Known Exploited", "CISA KEV", len(kev),
               kev_html)
         + panel("p-cve s8", "&#128273;", "Recent CVEs", f"NVD · {CVE_WINDOW}",
                 len(cves), cves_html, cve_ctl, ul_id="cves")
@@ -1486,6 +2382,12 @@ class Handler(BaseHTTPRequestHandler):
                 "updated": DATA["updated"],
             }).encode()
             ct, code = "application/json", 200
+        elif self.path.startswith("/watch"):
+            qs = urllib.parse.parse_qs(
+                urllib.parse.urlparse(self.path).query)
+            res = watch_post((qs.get("url") or [""])[0])
+            body = json.dumps(res, default=str).encode()
+            ct, code = "application/json", 200
         elif self.path in ("/", "/index.html"):
             body = render().encode()
             ct, code = "text/html; charset=utf-8", 200
@@ -1511,6 +2413,11 @@ def main():
 
      Threat Intel Console v4
 """, flush=True)
+    with DATA_LOCK:
+        cached = _cve_load()
+        if cached:
+            DATA["cves"] = cached
+            print(f"[*] CVE cache loaded: {len(cached)} rows", flush=True)
     threading.Thread(target=refresh_loop, daemon=True).start()
     srv = ThreadingHTTPServer(("0.0.0.0", PORT), Handler)
     print(f"[*] Serving on http://localhost:{PORT} "
